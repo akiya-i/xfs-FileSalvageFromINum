@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+# $0 {block-device} {path}
+
+use strict;
+use Data::Dumper;
+use File::stat;
+use Fcntl ':mode';
+use Date::Parse;
+
+pipe my $DBIR,my $DBIW;
+pipe my $DBOR,my $DBOW;
+
+select $DBIW; $|=1; select STDOUT; $|=1;
+
+my $xfs=shift;
+my $sal=shift;
+
+sub read_result()
+{
+	my @r;
+	my $rb;
+	
+	while ( sysread($DBOR,$rb,8192) >0 ){
+		push(@r,$rb);
+		last if ($rb =~ /xfs_db> $/);
+	}
+	$rb = join('',@r);
+
+	my @r;
+	foreach my $l (split(/\n/,$rb)){
+		push(@r,$l);
+#print ":$l:\n";
+	}
+	return @r;
+}
+
+
+my $NEWER = str2time('Jul 1 00:00:00 2015');
+my $SKIPIFEXIST = 0;
+my $PUTDATEONROOTFILE = 1;
+sub time2date($){
+	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($_[0]);
+	return sprintf("%04d%02d%02d",$year+1900,$mon+1,$mday);
+}
+
+restart:
+my $xfs_db_dead="xfs_db dead";
+
+eval {
+	
+	if (fork()==0){
+		open(STDIN,"<&",$DBIR) || die "Can't DUP STDIN\n";
+		open(STDOUT,">&",$DBOW) || die "Can't DUP STDOUT\n";
+	
+		exec "xfs_db","-r",$xfs;
+		die("Can't exec xfs_db. $?\n");
+	}
+	
+	$SIG{CHLD} = sub { wait(); die $xfs_db_dead; };
+	
+	
+
+	my $nfile =0; #re-spawn xfs-db
+	
+	read_result();
+	
+	while(<>){
+		chop;
+		my ($in, $path)=split(' ');
+	
+		if (! $path){ $path = "#".$in; }
+
+		my $file=$sal.$path;
+	
+		print "$in path=$path ";
+	
+		if ($SKIPIFEXIST && -e $file){
+			print "$file exsited. skip\n";
+			next;
+		}
+	
+		$nfile++;
+	
+		print $DBIW "inode $in\n";
+		read_result();
+	
+		my %IN;
+		print $DBIW "p\n";
+		foreach $_ ( read_result() ){
+			#print $_,"\n";
+			if (/core\.([\w.]+) = (.*)$/){ $IN{$1}=$2; }
+			elsif (/u.bmx(\[\w+\]) = (.*)$/){ $IN{bmx}=[$1,$2]; }
+			elsif (/(\w+) = (.*)$/){ $IN{$1}=$2; }
+		}
+#print Dumper(\%IN);
+		
+		print "sz=$IN{size} ct=$IN{'ctime.sec'} \n";
+	
+		next if (str2time($IN{'ctime.sec'}) < $NEWER);
+	
+		if ((oct($IN{mode}) & S_IFMT)==S_IFREG){
+			if ($PUTDATEONROOTFILE && $path !~ m:/:){
+				my $date=time2date(str2time($IN{'mtime.sec'}));
+				if (substr($path,0,2) eq '._'){ #Mac resource file
+					$path='._'.$date.'_'.substr($path,2);
+				}
+				else {
+					$path=$date.'_'.$path;
+				}
+				$file=$sal.$path;
+			}
+
+			{#prepare dir
+				my @dc=split(m:/:,$path);
+				for (my $i=0;$i<$#dc;$i++){
+					my $r= mkdir($sal.join('/',@dc[0..$i]),0777);
+	#				print "mkdir(".$sal.join('/',@dc[0..$i]).")=$r\n";
+				}
+			}
+			open(F,">",$file);
+			if ($IN{format} =~ /^2 /){
+				my @extl=split(' ',$IN{bmx}->[1]);
+				shift(@extl);
+if ($#extl >1){
+print Dumper(\%IN,\@extl);
+}
+				foreach my $e (@extl){
+					my ($idx,$startoff,$startblock,$blockcount,$extentflag)
+					 = split(/[:\[\],]+/,$e);
+	
+					for (;$blockcount>0;$blockcount--,$startblock++){
+						print $DBIW "fsb $startblock\n";
+						read_result();
+						print $DBIW "p\n";
+						foreach $_ ( read_result() ){
+							next if (! /^[0-9a-f]+:/);
+	
+							my @d = split(' ');
+							shift(@d);
+							print F pack("H8 H8 H8 H8 H8 H8 H8 H8",@d);
+						}
+					}
+				}
+			}
+			else {
+print "FORMAT=",$IN{format}," ",Dumper(\%IN);
+#exit 0;
+			}
+			truncate F,$IN{size};
+			close(F);
+			#set attr
+			chown $IN{uid},$IN{gid},$file;
+	print " chown $IN{uid},$IN{gid},$file;\n";
+			chmod oct($IN{mode})&07777,$file;
+			utime str2time($IN{'atime.sec'}),str2time($IN{'mtime.sec'}),$file;
+		}
+
+		print $DBIW "q\n" if ($nfile >10000); #ファイル1万個ごと、xfs_dbを替える。だんだん大きく、遅くなる。
+	
+	#last;
+	}
+	
+};#eval
+
+goto restart if ($@ && $@ =~ quotemeta($xfs_db_dead));
+
