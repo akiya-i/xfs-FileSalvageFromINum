@@ -7,6 +7,13 @@ use File::stat;
 use Fcntl ':mode';
 use Date::Parse;
 
+# options
+my $NEWER = 0//str2time('Jul 1 00:00:00 2015');
+my $SKIPIFEXIST = 0;
+my $PUTDATEONROOTFILE = 1;
+
+
+
 pipe my $DBIR,my $DBIW;
 pipe my $DBOR,my $DBOW;
 
@@ -35,9 +42,6 @@ sub read_result()
 }
 
 
-my $NEWER = str2time('Jul 1 00:00:00 2015');
-my $SKIPIFEXIST = 0;
-my $PUTDATEONROOTFILE = 1;
 sub time2date($){
 	my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($_[0]);
 	return sprintf("%04d%02d%02d",$year+1900,$mon+1,$mday);
@@ -96,7 +100,7 @@ eval {
 		
 		print "sz=$IN{size} ct=$IN{'ctime.sec'} \n";
 	
-		next if (str2time($IN{'ctime.sec'}) < $NEWER);
+		next if ($NEWER && str2time($IN{'ctime.sec'}) < $NEWER);
 	
 		if ((oct($IN{mode}) & S_IFMT)==S_IFREG){
 			if ($PUTDATEONROOTFILE && $path !~ m:/:){
